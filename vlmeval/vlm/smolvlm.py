@@ -333,7 +333,9 @@ class SmolVLM2(BaseModel):
             generated_ids,
             skip_special_tokens=True
         )[0]
-
+        
+        if 'Assistant: ' in generated_text:
+            generated_text = generated_text.split("Assistant: ")[1]
         return generated_text.strip()
 
     def _format_messages_for_dataset(self, message, dataset=None):
@@ -500,7 +502,7 @@ class SmolVLM2(BaseModel):
                 "role": msg['role'],
                 "content": content
             })
-        
+                
         # Process inputs using the chat template
         inputs = self.processor.apply_chat_template(
             chat_messages,
@@ -516,5 +518,4 @@ class SmolVLM2(BaseModel):
             generated_ids,
             skip_special_tokens=True
         )[0]
-
         return generated_text.strip()
