@@ -315,207 +315,274 @@ class SmolVLM2(BaseModel):
         torch.cuda.empty_cache()
 
     def generate_inner(self, message, dataset=None):
-        # Convert vlmeval message format to the expected format for SmolVLM2
-        messages = self._format_messages_for_dataset(message, dataset)
+        if dataset in ['MMBench_DEV_EN', 'MMBench_TEST_EN', 'MMBench_DEV_CN', 'MMBench_TEST_CN', 'MMBench',
+                       'MMBench_CN', 'MMBench_DEV_EN_V11', 'MMBench_DEV_CN_V11', 'MMBench_TEST_EN_V11',
+                       'MMBench_TEST_CN_V11', 'MMBench_V11', 'MMBench_CN_V11', 'CCBench']:
+            formatted_messages, formatted_images = self.build_prompt_mmbench(message)
+        elif dataset in ['MMMU_DEV_VAL', 'MMMU_TEST']:
+            formatted_messages, formatted_images = self.build_prompt_mmmu(message)
+        elif dataset in ['MathVista_MINI']:
+            formatted_messages, formatted_images = self.build_prompt_mathvista(message)
+        elif dataset in ['ChartQA_TEST']:
+            formatted_messages, formatted_images = self.build_prompt_chartqa(message)
+        elif dataset in ['DocVQA_VAL', 'DocVQA_TEST']:
+            formatted_messages, formatted_images = self.build_prompt_docvqa(message)
+        elif dataset in ['TextVQA_VAL', 'TextVQA_TEST']:
+            formatted_messages, formatted_images = self.build_prompt_textvqa(message)
+        elif dataset in ['MME', 'MMVet', 'OCRVQA_TEST', 'OCRVQA_TESTCORE', 'InfoVQA_VAL', 'InfoVQA_TEST', 'OCRBench']:
+            formatted_messages, formatted_images = self.build_prompt_default(message, add_brief=True)
+        elif dataset == 'HallusionBench':
+            formatted_messages, formatted_images = self.build_prompt_default(message, add_yes_or_no=True)
+        elif dataset in ['MMStar', 'SEEDBench_IMG', 'AI2D_TEST', 'ScienceQA_VAL', 'ScienceQA_TEST']:
+            formatted_messages, formatted_images = self.build_prompt_puremcq(message)
+        else:
+            formatted_messages, formatted_images = self.build_prompt_default(message)
+
+        # Convert to list if single image
+        images = [formatted_images] if isinstance(formatted_images, Image.Image) else formatted_images
         
-        # Process inputs using the chat template
-        inputs = self.processor.apply_chat_template(
-            messages,
-            add_generation_prompt=True,
-            tokenize=True,
-            return_dict=True,
+        # Process text and images directly
+        inputs = self.processor(
+            text=formatted_messages,
+            images=images,
             return_tensors="pt"
         ).to(self.model.device)
 
         # Generate response
         generated_ids = self.model.generate(**inputs, **self.kwargs)
+        
+        # Decode only the new tokens, not the entire sequence
         generated_text = self.processor.batch_decode(
-            generated_ids,
+            generated_ids[:, inputs['input_ids'].size(1):],
             skip_special_tokens=True
         )[0]
-        
-        if 'Assistant: ' in generated_text:
-            generated_text = generated_text.split("Assistant: ")[1]
+
         return generated_text.strip()
 
-    def _format_messages_for_dataset(self, message, dataset=None):
-        """
-        Format messages according to dataset requirements
-        """
-        user_content = []
-        
+    def build_prompt_default(self, message, add_brief=False, add_yes_or_no=False):
+        from transformers.image_utils import load_image
+        prompt, images = '<|im_start|>User:', []
         for msg in message:
             if msg['type'] == 'image':
-                # For image inputs (could be file path or URL)
-                if msg['value'].startswith('http'):
-                    user_content.append({"type": "image", "url": msg['value']})
-                else:
-                    user_content.append({"type": "image", "path": msg['value']})
-            elif msg['type'] == 'video':
-                # For video inputs
-                user_content.append({"type": "video", "path": msg['value']})
+                img = load_image(msg['value'])
+                images.append(img)
+                prompt += '<image>'
             elif msg['type'] == 'text':
-                # Add dataset-specific prompting strategies
-                prompt_text = self._adapt_prompt_for_dataset(msg['value'], dataset)
-                user_content.append({"type": "text", "text": prompt_text})
-        
-        return [{"role": "user", "content": user_content}]
-    
-    def _adapt_prompt_for_dataset(self, text, dataset=None):
-        """
-        Adapt prompts for specific datasets based on the previous implementation
-        """
-        if dataset in ['MMBench_DEV_EN', 'MMBench_TEST_EN', 'MMBench_DEV_CN', 'MMBench_TEST_CN', 'MMBench',
-                      'MMBench_CN', 'MMBench_DEV_EN_V11', 'MMBench_DEV_CN_V11', 'MMBench_TEST_EN_V11',
-                      'MMBench_TEST_CN_V11', 'MMBench_V11', 'MMBench_CN_V11', 'CCBench']:
-            # MMBench specific adaptations
-            replace_mapping = {
-                '\nOptions:': '\nChoices:',
-                'Please select the correct answer from the options above.': 'Answer with a letter.',
-            }
-            
-            for k, v in replace_mapping.items():
-                text = text.replace(k, v)
-                
-            # Swap hint and question if needed
-            if text.startswith('Hint:'):
-                hint, question = text.split('\nQuestion:')
-                question, choices = question.split('\nChoices:')
-                text = ('Question:' + question + '\n' + hint + '\nChoices:' + choices)
-                
-            return text
-            
-        elif dataset in ['MMMU_DEV_VAL', 'MMMU_TEST']:
-            # MMMU specific adaptations
-            replace_mapping = {
-                'Question:': '',
-                'Please select the correct answer from the options above.': 'Answer with the letter.',
-                '\nOptions:': '\nChoices:',
-            }
-            
-            for k, v in replace_mapping.items():
-                text = text.replace(k, v)
-                
-            return text
-            
-        elif dataset in ['MathVista_MINI']:
-            # MathVista specific adaptations
-            replace_mapping = {
-                '(A) ': 'A. ',
-                '(B) ': 'B. ',
-                '(C) ': 'C. ',
-                '(D) ': 'D. ',
-                '(E) ': 'E. ',
-                '(F) ': 'F. ',
-                '(G) ': 'G. ',
-                '(H) ': 'H. ',
-                '\nOptions:': '\nChoices:',
-                'Hint: ': '',
-            }
-            
-            for k, v in replace_mapping.items():
-                text = text.replace(k, v)
-                
-            return text
-            
-        elif dataset in ['ChartQA_TEST']:
-            # ChartQA specific adaptations
-            return "For the question below, follow the following instructions:\n" + \
-                   "-The answer should contain as few words as possible.\n" + \
-                   "-Don't paraphrase or reformat the text you see in the image.\n" + \
-                   "-Answer a binary question with Yes or No.\n" + \
-                   "-When asked to give a numerical value, provide a number like 2 instead of Two.\n" + \
-                   "-If the final answer has two or more items, provide it in the list format like [1, 2].\n" + \
-                   "-When asked to give a ratio, give out the decimal value like 0.25 instead of 1:4.\n" + \
-                   "-When asked to give a percentage, give out the whole value like 17 instead of decimal like 0.17%.\n" + \
-                   "-Don't include any units in the answer.\n" + \
-                   "-Do not include any full stops at the end of the answer.\n" + \
-                   "-Try to include the full label from the graph when asked about an entity.\n" + \
-                   "Question: " + text
-                   
-        elif dataset in ['DocVQA_VAL', 'DocVQA_TEST']:
-            # DocVQA specific adaptations
-            return "Give a short and terse answer to the following question. " + \
-                   "Do not paraphrase or reformat the text you see in the image. Do not include any full stops. " + \
-                   "Just give the answer without additional explanation. Question: " + text
-                   
-        elif dataset in ['TextVQA_VAL', 'TextVQA_TEST']:
-            # TextVQA specific adaptations
-            return "Answer the following question about the image using as few words as possible. " + \
-                   "Follow these additional instructions:\n" + \
-                   "-Always answer a binary question with Yes or No.\n" + \
-                   "-When asked what time it is, reply with the time seen in the image.\n" + \
-                   "-Do not put any full stops at the end of the answer.\n" + \
-                   "-Do not put quotation marks around the answer.\n" + \
-                   "-An answer with one or two words is favorable.\n" + \
-                   "-Do not apply common sense knowledge. The answer can be found in the image.\n" + \
-                   "Question: " + text
-                   
-        elif dataset in ['MME', 'MMVet', 'OCRVQA_TEST', 'OCRVQA_TESTCORE', 'InfoVQA_VAL', 'InfoVQA_TEST', 'OCRBench']:
-            # Brief answer datasets
-            return text + '\nGive a very brief answer.'
-            
-        elif dataset == 'HallusionBench':
-            # Yes/No answer dataset
-            return text + '\nAnswer yes or no.'
-            
-        elif dataset in ['MMStar', 'SEEDBench_IMG', 'AI2D_TEST', 'ScienceQA_VAL', 'ScienceQA_TEST']:
-            # MCQ datasets
-            replace_mapping = {
-                '\nOptions:': '\nChoices:',
-                'Please select the correct answer from the options above.': 'Answer with the letter.',
-            }
-            
-            for k, v in replace_mapping.items():
-                text = text.replace(k, v)
-                
-            return text
-            
-        else:
-            # Default case, no special adaptation
-            return text
-            
-    def chat_inner(self, message, dataset=None):
-        """
-        Handle chat conversations with the model
-        """
-        chat_messages = []
-        
+                prompt += msg['value'].strip()
+        if add_brief:
+            prompt += '\nGive a very brief answer.'
+        if add_yes_or_no:
+            prompt += '\nAnswer yes or no.'
+        prompt += '<end_of_utterance>\nAssistant:'
+        return prompt, images
+
+    def build_prompt_puremcq(self, message):
+        from transformers.image_utils import load_image
+        replace_mapping = {
+            '\nOptions:': '\nChoices:',
+            'Please select the correct answer from the options above.': 'Answer with the letter.',
+        }
+
+        prompt, images = '<|im_start|>User:', []
         for msg in message:
-            content = []
-            if 'content' in msg:
-                for item in msg['content']:
-                    if item['type'] == 'image':
-                        # Handle image input
-                        if 'value' in item and item['value'].startswith('http'):
-                            content.append({"type": "image", "url": item['value']})
-                        else:
-                            content.append({"type": "image", "path": item['value']})
-                    elif item['type'] == 'video':
-                        # Handle video input
-                        content.append({"type": "video", "path": item['value']})
-                    elif item['type'] == 'text':
-                        # Handle text input
-                        content.append({"type": "text", "text": item['value']})
-            
-            chat_messages.append({
-                "role": msg['role'],
-                "content": content
-            })
-                
-        # Process inputs using the chat template
-        inputs = self.processor.apply_chat_template(
-            chat_messages,
-            add_generation_prompt=True,
-            tokenize=True,
-            return_dict=True,
+            if msg['type'] == 'image':
+                img = load_image(msg['value'])
+                images.append(img)
+                prompt += '<image>'
+            elif msg['type'] == 'text':
+                instruction = msg['value'].strip()
+                for k, v in replace_mapping.items():
+                    instruction = instruction.replace(k, v)
+                prompt += instruction
+        prompt += '<end_of_utterance>\nAssistant: Answer:'
+        return prompt, images
+
+    def build_prompt_mt(self, message):
+        from transformers.image_utils import load_image
+        prompt, images = '', []
+        for msg in message:
+            if msg['role'] == 'user':
+                prompt += 'User: '
+            elif msg['role'] == 'assistant':
+                prompt += 'Assistant: '
+            for item in msg['content']:
+                if item['type'] == 'image':
+                    img = load_image(item['value'])
+                    images.append(img)
+                elif item['type'] == 'text':
+                    prompt += item['value'].strip()
+                prompt += '<end_of_utterance>\n'
+        return prompt + 'Assistant: '
+
+    def build_prompt_mmbench(self, message):
+        from transformers.image_utils import load_image
+        replace_mapping = {
+            '\nOptions:': '\nChoices:',
+            'Please select the correct answer from the options above.': 'Answer with a letter.',
+        }
+
+        prompt, images = '<|im_start|>User:<image>', []
+        for msg in message:
+            if msg['type'] == 'image':
+                img = load_image(msg['value'])
+                images.append(img)
+            elif msg['type'] == 'text':
+                instruction = msg['value'].strip()
+                for k, v in replace_mapping.items():
+                    instruction = instruction.replace(k, v)
+                # Swap hint and question
+                if instruction.startswith('Hint:'):
+                    hint, question = instruction.split('\nQuestion:')
+                    question, choices = question.split('\nChoices:')
+                    instruction = (
+                        'Question:' + question + '\n' + hint + '\nChoices:' + choices
+                    )
+                prompt += instruction
+        prompt += '<end_of_utterance>\nAssistant: Answer:'
+        return prompt, images
+
+    def build_prompt_mmmu(self, message):
+        from transformers.image_utils import load_image
+        replace_mapping = {
+            'Question:': '',
+            'Please select the correct answer from the options above.': 'Answer with the letter.',
+            '\nOptions:': '\nChoices:',
+        }
+
+        prompt, images, img_counter = '<|im_start|>User: Question: ', [], 1
+        for msg in message:
+            if msg['type'] == 'image':
+                prompt += f'<image {img_counter}>:<image>\n'
+                img_counter += 1
+        img_counter = 1
+
+        for msg in message:
+            if msg['type'] == 'image':
+                img = load_image(msg['value'])
+                images.append(img)
+                prompt += f' <image {img_counter}> '
+                img_counter += 1
+            elif msg['type'] == 'text':
+                instruction = msg['value'].strip()
+                for k, v in replace_mapping.items():
+                    instruction = instruction.replace(k, v)
+                prompt += instruction.strip()
+        prompt += '<end_of_utterance>\nAssistant:'
+        if 'A.' in prompt and 'B.' in prompt:
+            prompt += ' Answer:'
+        return prompt, images
+
+    def build_prompt_mathvista(self, message):
+        from transformers.image_utils import load_image
+        replace_mapping = {
+            '(A) ': 'A. ',
+            '(B) ': 'B. ',
+            '(C) ': 'C. ',
+            '(D) ': 'D. ',
+            '(E) ': 'E. ',
+            '(F) ': 'F. ',
+            '(G) ': 'G. ',
+            '(H) ': 'H. ',
+            '\nOptions:': '\nChoices:',
+            'Hint: ': '',
+        }
+
+        prompt, images = '<|im_start|>User:<image>', []
+        for msg in message:
+            if msg['type'] == 'image':
+                img = load_image(msg['value'])
+                images.append(img)
+            elif msg['type'] == 'text':
+                instruction = msg['value'].strip()
+                for k, v in replace_mapping.items():
+                    instruction = instruction.replace(k, v)
+                prompt += instruction.strip()
+
+        prompt += '<end_of_utterance>\nAssistant:'
+        if 'A.' in prompt and 'B.' in prompt:
+            prompt += ' Answer:'
+        return prompt, images
+
+    def build_prompt_chartqa(self, message):
+        from transformers.image_utils import load_image
+        prompt = "<|im_start|>User:<image>For the question below, follow the following instructions:\n" + \
+        "-The answer should contain as few words as possible.\n" + \
+        "-Don't paraphrase or reformat the text you see in the image.\n" + \
+        "-Answer a binary question with Yes or No.\n" + \
+        "-When asked to give a numerical value, provide a number like 2 instead of Two.\n" + \
+        "-If the final answer has two or more items, provide it in the list format like [1, 2].\n" + \
+        "-When asked to give a ratio, give out the decimal value like 0.25 instead of 1:4.\n" + \
+        "-When asked to give a percentage, give out the whole value like 17 instead of decimal like 0.17%.\n" + \
+        "-Don't include any units in the answer.\n" + \
+        "-Do not include any full stops at the end of the answer.\n" + \
+        "-Try to include the full label from the graph when asked about an entity.\n" + \
+        "Question: "
+        images = []
+        for msg in message:
+            if msg['type'] == 'image':
+                img = load_image(msg['value'])
+                images.append(img)
+            elif msg['type'] == 'text':
+                prompt += msg['value'].strip()
+        prompt += '<end_of_utterance>\nAssistant:'
+        return prompt, images
+    
+    def build_prompt_docvqa(self, message):
+        from transformers.image_utils import load_image
+        prompt = "<|im_start|>User:<image>Give a short and terse answer to the following question. " + \
+            "Do not paraphrase or reformat the text you see in the image. Do not include any full stops. " + \
+            "Just give the answer without additional explanation. Question: "
+        
+        images = []
+        for msg in message:
+            if msg['type'] == 'image':
+                img = load_image(msg['value'])
+                images.append(img)
+            elif msg['type'] == 'text':
+                prompt += msg['value'].strip()
+        prompt += '<end_of_utterance>\nAssistant:'
+        return prompt, images
+
+    def build_prompt_textvqa(self, message):
+        from transformers.image_utils import load_image
+        prompt = "<|im_start|>User:<image>Answer the following question about the image using as few words as possible. " + \
+        "Follow these additional instructions:\n" + \
+        "-Always answer a binary question with Yes or No.\n" + \
+        "-When asked what time it is, reply with the time seen in the image.\n" + \
+        "-Do not put any full stops at the end of the answer.\n" + \
+        "-Do not put quotation marks around the answer.\n" + \
+        "-An answer with one or two words is favorable.\n" + \
+        "-Do not apply common sense knowledge. The answer can be found in the image.\n" + \
+        "Question: "
+        images = []
+        for msg in message:
+            if msg['type'] == 'image':
+                img = load_image(msg['value'])
+                images.append(img)
+            elif msg['type'] == 'text':
+                prompt += msg['value'].strip()
+        prompt += '<end_of_utterance>\nAssistant:'
+        return prompt, images
+
+    def chat_inner(self, message, dataset=None):
+        # Use the same build_prompt_mt method as in SmolVLM
+        formatted_messages, formatted_images = self.build_prompt_mt(message)
+        images = [formatted_images] if isinstance(formatted_images, Image.Image) else formatted_images
+
+        # Process text and images directly
+        inputs = self.processor(
+            text=formatted_messages,
+            images=images,
             return_tensors="pt"
         ).to(self.model.device)
 
         # Generate response
         generated_ids = self.model.generate(**inputs, **self.kwargs)
+        
+        # Decode only the new tokens, not the entire sequence
         generated_text = self.processor.batch_decode(
-            generated_ids,
+            generated_ids[:, inputs['input_ids'].size(1):],
             skip_special_tokens=True
         )[0]
+
         return generated_text.strip()
