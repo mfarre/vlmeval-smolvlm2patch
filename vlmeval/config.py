@@ -315,6 +315,10 @@ smolvlm_series = {
     'SmolVLM': partial(SmolVLM, model_path='HuggingFaceTB/SmolVLM-Instruct'),
     'SmolVLM-DPO': partial(SmolVLM, model_path='HuggingFaceTB/SmolVLM-Instruct-DPO'),
     'SmolVLM-Synthetic': partial(SmolVLM, model_path='HuggingFaceTB/SmolVLM-Synthetic'),
+    'SmolVLM2-256M': partial(SmolVLM2, model_path='HuggingFaceTB/SmolVLM2-256M-Video-Instruct'),
+    'SmolVLM2-500M': partial(SmolVLM2, model_path='HuggingFaceTB/SmolVLM2-500M-Video-Instruct'),
+    'SmolVLM2': partial(SmolVLM2, model_path='HuggingFaceTB/SmolVLM2-2.2B-Instruct'),
+
 }
 
 instructblip_series = {

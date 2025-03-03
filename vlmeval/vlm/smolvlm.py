@@ -290,3 +290,231 @@ class SmolVLM(BaseModel):
         )[0]
 
         return generated_text.strip()
+
+class SmolVLM2(BaseModel):
+    INSTALL_REQ = True
+    INTERLEAVE = True
+
+    def __init__(self, model_path='HuggingFaceTB/SmolVLM2-2.2B-Instruct', **kwargs):
+        from transformers import AutoProcessor, AutoModelForImageTextToText
+        import torch
+        assert osp.exists(model_path) or splitlen(model_path) == 2
+
+        self.processor = AutoProcessor.from_pretrained(model_path)
+        self.model = AutoModelForImageTextToText.from_pretrained(
+            model_path,
+            torch_dtype=torch.float32,
+        ).to("cuda")
+
+        kwargs_default = {'max_new_tokens': 2048,
+                         'do_sample': False,
+                         'use_cache': True}
+        kwargs_default.update(kwargs)
+        self.kwargs = kwargs_default
+        warnings.warn(f'Following kwargs received: {self.kwargs}, will use as generation config.')
+        torch.cuda.empty_cache()
+
+    def generate_inner(self, message, dataset=None):
+        # Convert vlmeval message format to the expected format for SmolVLM2
+        messages = self._format_messages_for_dataset(message, dataset)
+        
+        # Process inputs using the chat template
+        inputs = self.processor.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt"
+        ).to(self.model.device)
+
+        # Generate response
+        generated_ids = self.model.generate(**inputs, **self.kwargs)
+        generated_text = self.processor.batch_decode(
+            generated_ids,
+            skip_special_tokens=True
+        )[0]
+
+        return generated_text.strip()
+
+    def _format_messages_for_dataset(self, message, dataset=None):
+        """
+        Format messages according to dataset requirements
+        """
+        user_content = []
+        
+        for msg in message:
+            if msg['type'] == 'image':
+                # For image inputs (could be file path or URL)
+                if msg['value'].startswith('http'):
+                    user_content.append({"type": "image", "url": msg['value']})
+                else:
+                    user_content.append({"type": "image", "path": msg['value']})
+            elif msg['type'] == 'video':
+                # For video inputs
+                user_content.append({"type": "video", "path": msg['value']})
+            elif msg['type'] == 'text':
+                # Add dataset-specific prompting strategies
+                prompt_text = self._adapt_prompt_for_dataset(msg['value'], dataset)
+                user_content.append({"type": "text", "text": prompt_text})
+        
+        return [{"role": "user", "content": user_content}]
+    
+    def _adapt_prompt_for_dataset(self, text, dataset=None):
+        """
+        Adapt prompts for specific datasets based on the previous implementation
+        """
+        if dataset in ['MMBench_DEV_EN', 'MMBench_TEST_EN', 'MMBench_DEV_CN', 'MMBench_TEST_CN', 'MMBench',
+                      'MMBench_CN', 'MMBench_DEV_EN_V11', 'MMBench_DEV_CN_V11', 'MMBench_TEST_EN_V11',
+                      'MMBench_TEST_CN_V11', 'MMBench_V11', 'MMBench_CN_V11', 'CCBench']:
+            # MMBench specific adaptations
+            replace_mapping = {
+                '\nOptions:': '\nChoices:',
+                'Please select the correct answer from the options above.': 'Answer with a letter.',
+            }
+            
+            for k, v in replace_mapping.items():
+                text = text.replace(k, v)
+                
+            # Swap hint and question if needed
+            if text.startswith('Hint:'):
+                hint, question = text.split('\nQuestion:')
+                question, choices = question.split('\nChoices:')
+                text = ('Question:' + question + '\n' + hint + '\nChoices:' + choices)
+                
+            return text
+            
+        elif dataset in ['MMMU_DEV_VAL', 'MMMU_TEST']:
+            # MMMU specific adaptations
+            replace_mapping = {
+                'Question:': '',
+                'Please select the correct answer from the options above.': 'Answer with the letter.',
+                '\nOptions:': '\nChoices:',
+            }
+            
+            for k, v in replace_mapping.items():
+                text = text.replace(k, v)
+                
+            return text
+            
+        elif dataset in ['MathVista_MINI']:
+            # MathVista specific adaptations
+            replace_mapping = {
+                '(A) ': 'A. ',
+                '(B) ': 'B. ',
+                '(C) ': 'C. ',
+                '(D) ': 'D. ',
+                '(E) ': 'E. ',
+                '(F) ': 'F. ',
+                '(G) ': 'G. ',
+                '(H) ': 'H. ',
+                '\nOptions:': '\nChoices:',
+                'Hint: ': '',
+            }
+            
+            for k, v in replace_mapping.items():
+                text = text.replace(k, v)
+                
+            return text
+            
+        elif dataset in ['ChartQA_TEST']:
+            # ChartQA specific adaptations
+            return "For the question below, follow the following instructions:\n" + \
+                   "-The answer should contain as few words as possible.\n" + \
+                   "-Don't paraphrase or reformat the text you see in the image.\n" + \
+                   "-Answer a binary question with Yes or No.\n" + \
+                   "-When asked to give a numerical value, provide a number like 2 instead of Two.\n" + \
+                   "-If the final answer has two or more items, provide it in the list format like [1, 2].\n" + \
+                   "-When asked to give a ratio, give out the decimal value like 0.25 instead of 1:4.\n" + \
+                   "-When asked to give a percentage, give out the whole value like 17 instead of decimal like 0.17%.\n" + \
+                   "-Don't include any units in the answer.\n" + \
+                   "-Do not include any full stops at the end of the answer.\n" + \
+                   "-Try to include the full label from the graph when asked about an entity.\n" + \
+                   "Question: " + text
+                   
+        elif dataset in ['DocVQA_VAL', 'DocVQA_TEST']:
+            # DocVQA specific adaptations
+            return "Give a short and terse answer to the following question. " + \
+                   "Do not paraphrase or reformat the text you see in the image. Do not include any full stops. " + \
+                   "Just give the answer without additional explanation. Question: " + text
+                   
+        elif dataset in ['TextVQA_VAL', 'TextVQA_TEST']:
+            # TextVQA specific adaptations
+            return "Answer the following question about the image using as few words as possible. " + \
+                   "Follow these additional instructions:\n" + \
+                   "-Always answer a binary question with Yes or No.\n" + \
+                   "-When asked what time it is, reply with the time seen in the image.\n" + \
+                   "-Do not put any full stops at the end of the answer.\n" + \
+                   "-Do not put quotation marks around the answer.\n" + \
+                   "-An answer with one or two words is favorable.\n" + \
+                   "-Do not apply common sense knowledge. The answer can be found in the image.\n" + \
+                   "Question: " + text
+                   
+        elif dataset in ['MME', 'MMVet', 'OCRVQA_TEST', 'OCRVQA_TESTCORE', 'InfoVQA_VAL', 'InfoVQA_TEST', 'OCRBench']:
+            # Brief answer datasets
+            return text + '\nGive a very brief answer.'
+            
+        elif dataset == 'HallusionBench':
+            # Yes/No answer dataset
+            return text + '\nAnswer yes or no.'
+            
+        elif dataset in ['MMStar', 'SEEDBench_IMG', 'AI2D_TEST', 'ScienceQA_VAL', 'ScienceQA_TEST']:
+            # MCQ datasets
+            replace_mapping = {
+                '\nOptions:': '\nChoices:',
+                'Please select the correct answer from the options above.': 'Answer with the letter.',
+            }
+            
+            for k, v in replace_mapping.items():
+                text = text.replace(k, v)
+                
+            return text
+            
+        else:
+            # Default case, no special adaptation
+            return text
+            
+    def chat_inner(self, message, dataset=None):
+        """
+        Handle chat conversations with the model
+        """
+        chat_messages = []
+        
+        for msg in message:
+            content = []
+            if 'content' in msg:
+                for item in msg['content']:
+                    if item['type'] == 'image':
+                        # Handle image input
+                        if 'value' in item and item['value'].startswith('http'):
+                            content.append({"type": "image", "url": item['value']})
+                        else:
+                            content.append({"type": "image", "path": item['value']})
+                    elif item['type'] == 'video':
+                        # Handle video input
+                        content.append({"type": "video", "path": item['value']})
+                    elif item['type'] == 'text':
+                        # Handle text input
+                        content.append({"type": "text", "text": item['value']})
+            
+            chat_messages.append({
+                "role": msg['role'],
+                "content": content
+            })
+        
+        # Process inputs using the chat template
+        inputs = self.processor.apply_chat_template(
+            chat_messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt"
+        ).to(self.model.device)
+
+        # Generate response
+        generated_ids = self.model.generate(**inputs, **self.kwargs)
+        generated_text = self.processor.batch_decode(
+            generated_ids,
+            skip_special_tokens=True
+        )[0]
+
+        return generated_text.strip()
