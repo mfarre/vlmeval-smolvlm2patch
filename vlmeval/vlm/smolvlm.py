@@ -16,14 +16,13 @@ class SmolVLM(BaseModel):
     def __init__(self, model_path='HuggingFaceTB/SmolVLM-Instruct', **kwargs):
         from transformers import AutoProcessor, Idefics3ForConditionalGeneration
         assert osp.exists(model_path) or splitlen(model_path) == 2
-
+        
         self.processor = AutoProcessor.from_pretrained(model_path)
         self.model = Idefics3ForConditionalGeneration.from_pretrained(
             model_path,
             torch_dtype=torch.float32,
             device_map='cuda'
         )
-
         kwargs_default = {'max_new_tokens': 2048,
                           'use_cache': True}
         kwargs_default.update(kwargs)
@@ -300,6 +299,15 @@ class SmolVLM2(BaseModel):
         import torch
         assert osp.exists(model_path) or splitlen(model_path) == 2
 
+        self.sampling_frames = 64
+        # Set resolution based on model
+        if 'SmolVLM2-2.2B' in model_path:
+            self.resolution = 384
+        elif 'SmolVLM2-256M' in model_path or 'SmolVLM2-500M' in model_path:
+            self.resolution = 512
+        else:
+            raise ValueError(f"Unknown model {model_path}, cannot determine resolution")
+        
         self.processor = AutoProcessor.from_pretrained(model_path)
         self.model = AutoModelForImageTextToText.from_pretrained(
             model_path,
@@ -335,6 +343,10 @@ class SmolVLM2(BaseModel):
             formatted_messages, formatted_images = self.build_prompt_default(message, add_yes_or_no=True)
         elif dataset in ['MMStar', 'SEEDBench_IMG', 'AI2D_TEST', 'ScienceQA_VAL', 'ScienceQA_TEST']:
             formatted_messages, formatted_images = self.build_prompt_puremcq(message)
+        elif dataset in ['MLVU', 'MLVU_MCQ', 'MLVU_OpenEnded', 'TempCompass', 'TempCompass_MCQ', 
+                        'TempCompass_Captioning', 'TempCompass_YorN', 'MVBench', 'MVBench_MP4', 
+                        'Video-MME', 'LongVideoBench']:
+            formatted_messages, formatted_images = self.build_prompt_video(message, dataset)
         else:
             formatted_messages, formatted_images = self.build_prompt_default(message)
 
@@ -374,6 +386,138 @@ class SmolVLM2(BaseModel):
         if add_yes_or_no:
             prompt += '\nAnswer yes or no.'
         prompt += '<end_of_utterance>\nAssistant:'
+        return prompt, images
+
+
+    def read_image(self, path):
+        """Read and convert an image to RGB format"""
+        from PIL import Image
+        return Image.open(path).convert("RGB")
+
+    def build_prompt_video(self, message, dataset, add_timestamps=True):
+        """Build prompt for video datasets with frame sampling"""
+        import numpy as np
+        from transformers.image_utils import load_image
+        from PIL import Image
+        
+        # Configure processor for video frames
+        self.processor.image_processor.size = {"longest_edge": self.resolution}
+        self.processor.image_processor.do_resize = True
+        self.processor.image_processor.do_image_splitting = False
+        self.processor.do_image_splitting = False
+        self.processor.image_size =  {"longest_edge": self.resolution}
+        
+        # Initialize prompt parts and image lists
+        prompt_parts = []
+        image_blocks = []
+        images = []
+
+        # Find system message first
+        system_message = next(
+            (msg for msg in message if msg["type"] == "text" and msg.get("role") == "system"),
+            None,
+        )
+
+        # Add system message with proper format if it exists
+        if system_message:
+            prompt_parts.extend(["<|im_start|>System:", system_message["value"], "<end_of_utterance>\n"])
+        else:
+            # Adding default system message
+            prompt_parts.extend([
+                "<|im_start|>System:",
+                "pay attention to the video and answer the question",
+                "<end_of_utterance>\n"
+            ])
+        
+        # Add User prefix
+        prompt_parts.extend(["<|im_start|>User:", "Here are some frames sampled from a video:\n"])
+
+        # Process image blocks
+        text_messages = []
+        current_block = []
+
+        for msg in message:
+            if msg["type"] == "image":
+                current_block.append(msg)
+            else:
+                if current_block:
+                    image_blocks.append(current_block)
+                    current_block = []
+                if msg.get("role") != "system":  # Skip system message as it's already added
+                    text_messages.append(msg)
+
+        if current_block:
+            image_blocks.append(current_block)
+
+        # Process image blocks with sampling if needed
+        for block in image_blocks:
+            if len(block) > self.sampling_frames:
+                frame_indices = np.linspace(0, len(block) - 1, self.sampling_frames, dtype=int).tolist()
+                trimmed_block = [block[i] for i in frame_indices]
+                block_timestamps = [f"{i // 60:02}:{i % 60:02}" for i in frame_indices]
+            else:
+                trimmed_block = block
+                block_timestamps = [f"{i // 60:02}:{i % 60:02}" for i in range(len(block))]
+            
+            # Add frames with optional timestamps
+            for img, ts in zip(trimmed_block, block_timestamps):
+                ts_str = f"{ts}" if add_timestamps else ""
+                prompt_parts.extend([f"Frame from {ts_str}:", "<image>"])
+                try:
+                    images.append(load_image(img["value"]))
+                except:
+                    images.append(self.read_image(img["value"]))
+            prompt_parts.append("\n")
+
+        # Add remaining text
+        for msg in text_messages:
+            prompt_parts.append(msg["value"].strip())
+
+        # Finalize prompt
+        prompt_parts.append("<end_of_utterance>")
+        prompt_parts.append("\nAssistant:")
+
+        # Combine prompt parts
+        prompt = " ".join(prompt_parts)
+
+        # Format prompt based on dataset type
+        if dataset in ["MLVU_MCQ", "MLVU_OpenEnded", "LongVideoBench"]:
+            prompt = prompt.replace(
+                "Options:",
+                "respond ONLY with one of the multiple choice letter options (A/B/C/D):"
+            )
+        elif dataset in ["TempCompass_MCQ", "TempCompass_Captioning", "TempCompass_YorN"]:
+            if dataset == "TempCompass_YorN":
+                prompt += "\nAnswer yes or no."
+            elif dataset == "TempCompass_MCQ":
+                prompt = prompt.replace("Options:", "Choices:")
+                prompt = prompt.replace(
+                    "Please select the correct answer from the options above.",
+                    "Answer with the letter."
+                )
+        elif dataset in ["MVBench", "MVBench_MP4"]:
+            if "Options:" in prompt:
+                prompt = prompt.replace(
+                    "Options:",
+                    "respond ONLY with one of the multiple choice letter options (A/B/C/D):"
+                )
+                prompt = prompt.replace("Best option:(", "Answer:")
+        elif dataset in ["Video-MME"]:
+            if "Options:" in prompt:
+                prompt = prompt.replace("Options:", "Choices:")
+                prompt = prompt.replace(
+                    "Please select the correct answer from the options above.",
+                    "Answer with the letter."
+                )
+        elif dataset == "MLVU":
+            # Generic handling for MLVU dataset
+            pass
+        elif dataset == "TempCompass":
+            # Generic handling for TempCompass dataset
+            pass
+        else:
+            print(f"Warning: No specific formatting for {dataset}, using default")
+
         return prompt, images
 
     def build_prompt_puremcq(self, message):
